@@ -28,6 +28,7 @@ Install the dependencies
  * sql_query
  * sql_command
  * max_reconnection_attempts
+ * reconnect_timeout_seconds
 
  ### Running the script
 
