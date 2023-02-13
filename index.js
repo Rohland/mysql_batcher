@@ -1,6 +1,6 @@
 /**
  * A utility script allows one to run batch updates in the background on MySQL (either updates, inserts or deletes).
- * This avoids long running table level locks. Configure the connection and parameters below.
+ * This avoids long-running table level locks. Configure the connection and parameters below.
  * 
  * Configure the:
  * 	- connection (MySQL connection details, can be hard coded or passed in as env params)
@@ -10,9 +10,11 @@
  * - command: the query to process the data (insert it, update it, delete it etc)
  */
 
-const mysql = require('./mysql');
-const fs = require('fs');
-const readline = require('readline');
+const mysql = require("./mysql");
+const fs = require("fs");
+const readline = require("readline");
+const dotenv = require("dotenv");
+dotenv.config();
 
 const connection = {
     host: process.env.mysql_host || "localhost",
@@ -23,8 +25,12 @@ const connection = {
     timezone: "+00:00"
 };
 
+const maxReconnectionAttempts = process.env.max_reconnection_attempts || 3;
+const reconnectTimeoutMs = (process.env.reconnect_timeout_seconds || 3) * 1000;
+const currentPositionFilePath = "./position.json";
 const batchSize = process.env.batch_size || 1;
-let id = process.env.start_id || 0;
+let currentId = fetchCurrentId();
+let id = currentId || process.env.start_id || 0;
 
 const query = process.env.sql_query || `
         select id as id
@@ -45,6 +51,7 @@ const logError = function(msg, ...args) { console.error((new Date().toISOString(
 // -------------------------------------------------------------------------------------------------------------
 mysql.init(connection);
 let rowCount = 0;
+let consecutiveReconnectCount = 0;
 
 /**
  * Processes the array of identifiers retrieved by the fetch statement
@@ -59,10 +66,10 @@ async function processUpdatesFor(data) {
     id = maxId;
     rowCount += ids.length;
     log('   Processed batch, row count: %s', rowCount);
-};
+}
 
 /**
- * Fetches the data to be process in a batch
+ * Fetches the data to be processed in a batch
  */
 async function fetchData(){
     log('Fetching batch with id > %s', id);
@@ -77,12 +84,42 @@ async function fetchData(){
             return;
         }
         await processUpdatesFor(results);
+        saveCurrentId();
         setImmediate(async () => await fetchData()); // avoids memory leaks with deep stack
+        consecutiveReconnectCount = 0;
     } catch(err) {
+        const shouldAttemptToReconnect = err.code === 'PROTOCOL_CONNECTION_LOST'
+            && consecutiveReconnectCount < maxReconnectionAttempts;
+        if (shouldAttemptToReconnect) {
+            logError(`😣 Connection to MySQL was lost, trying again in ${ reconnectTimeoutMs / 1000 } seconds: ${err.toString()}`, err);
+            setTimeout(() => {
+                consecutiveReconnectCount++;
+                log('Connection attempt #%s', consecutiveReconnectCount);
+                fetchData();
+            }, reconnectTimeoutMs);
+            return;
+        }
         logError(`❌ Error executing process: ${err.toString()}`, err);
         process.exit(-1);
     }
-};
+}
+
+function fetchCurrentId() {
+    const raw = fs.readFileSync(currentPositionFilePath);
+    if (!raw || raw.length === 0) {
+        return 0;
+    }
+    const data = JSON.parse(raw);
+    return data.id || 0;
+}
+
+function saveCurrentId() {
+    const data = {
+        id: id,
+    };
+    const text = JSON.stringify(data);
+    fs.writeFileSync(currentPositionFilePath, text);
+}
 
 const confirm = readline.createInterface({
     input: process.stdin,
@@ -103,7 +140,7 @@ output.push('Reply y to start: ');
 
 (async () => {
     if (process.argv[2] === 'f') {
-        fetchData();
+        await fetchData();
         return;
     }
     confirm.question(`Are you sure you want to run the batch process with the following configuration: \r\n\r\n` + output.join('\r\n'), function(answer){
